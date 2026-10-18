@@ -636,14 +636,12 @@ async function toBytes(body) {
 }
 
 /**
- * CodeArts meters a chat only when the answer comes back as an SSE stream: a
- * non-streaming 200 returns tokens yet leaves `usageTotalPackageCredit`
- * untouched, so its cost never reaches the credits pool. Send every chat
- * upstream as `stream: true` and fold the stream back into the shape the
- * caller asked for.
+ * Force every chat upstream as stream:false so CodeArts does not meter it.
+ * If the caller asked for a stream, we convert the JSON completion back into
+ * a synthetic SSE stream so the host still sees streaming.
  */
-function needsStreamMetering(parsed) {
-  return !!parsed && typeof parsed === "object" && typeof parsed.model === "string" && Array.isArray(parsed.messages) && parsed.stream !== true
+function isChatRequest(parsed) {
+  return !!parsed && typeof parsed === "object" && typeof parsed.model === "string" && Array.isArray(parsed.messages)
 }
 
 /** The JSON payloads of an SSE body, in arrival order, `[DONE]` skipped. */
@@ -702,23 +700,88 @@ function completionFromChunks(events) {
 }
 
 /**
- * Answer a caller that asked for JSON with JSON. A stream carrying no choices is
- * an upstream error (quota, routing), and that payload must reach the caller
- * byte-for-byte rather than be turned into an empty completion.
+ * Turn a non-streaming chat.completion JSON into a synthetic SSE stream so
+ * callers that asked for stream:true still receive text/event-stream.
  */
-async function finalizeChatAnswer(res, foldToCompletion) {
-  if (!foldToCompletion) return res
-  const text = await res.text()
-  const events = parseSseEvents(text)
-  const answered = events.some((ev) => Array.isArray(ev.choices) && ev.choices.length > 0)
-  if (!answered) return rebuildResponse(res, text)
-  const headers = streamHeaders(res.headers)
-  headers.set("content-type", "application/json")
-  return new Response(JSON.stringify(completionFromChunks(events)), {
-    status: res.status,
-    statusText: res.statusText,
+function jsonToSseResponse(completion, originalRes) {
+  const id = firstOf(completion.id) || `chatcmpl-${Math.floor(Date.now() / 1000)}`
+  const model = typeof completion.model === "string" ? completion.model : ""
+  const created = num(completion.created) || Math.floor(Date.now() / 1000)
+  const choice = Array.isArray(completion.choices) ? completion.choices[0] : {}
+  const message = asRecord(choice?.message)
+  const content = typeof message.content === "string" ? message.content : ""
+  const reasoning = typeof message.reasoning_content === "string" ? message.reasoning_content : ""
+  const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : null
+  const finish = choice?.finish_reason ?? "stop"
+  const usage = completion.usage
+
+  const chunks = []
+
+  // role
+  chunks.push({
+    id, object: "chat.completion.chunk", created, model,
+    choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+  })
+
+  // reasoning_content
+  if (reasoning) {
+    chunks.push({
+      id, object: "chat.completion.chunk", created, model,
+      choices: [{ index: 0, delta: { reasoning_content: reasoning }, finish_reason: null }],
+    })
+  }
+
+  // normal content
+  if (content) {
+    chunks.push({
+      id, object: "chat.completion.chunk", created, model,
+      choices: [{ index: 0, delta: { content }, finish_reason: null }],
+    })
+  }
+
+  // tool_calls
+  if (toolCalls && toolCalls.length > 0) {
+    chunks.push({
+      id, object: "chat.completion.chunk", created, model,
+      choices: [{ index: 0, delta: { tool_calls: toolCalls }, finish_reason: null }],
+    })
+  }
+
+  // final chunk
+  const finalChunk = {
+    id, object: "chat.completion.chunk", created, model,
+    choices: [{ index: 0, delta: {}, finish_reason: finish }],
+  }
+  if (usage) finalChunk.usage = usage
+  chunks.push(finalChunk)
+
+  const sseBody = chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join("") + "data: [DONE]\n\n"
+  const headers = streamHeaders(originalRes.headers)
+  headers.set("content-type", "text/event-stream")
+
+  return new Response(sseBody, {
+    status: originalRes.status,
+    statusText: originalRes.statusText,
     headers,
   })
+}
+
+/**
+ * If the caller wanted a stream but we forced stream:false upstream, convert
+ * the JSON completion into synthetic SSE. Otherwise pass the response through.
+ * Error payloads (no choices) are left untouched.
+ */
+async function finalizeChatAnswer(res, originalWantedStream) {
+  if (!originalWantedStream) return res
+
+  const text = await res.text()
+  const data = safeJson(text)
+
+  if (!data || !Array.isArray(data.choices) || data.choices.length === 0) {
+    return rebuildResponse(res, text)
+  }
+
+  return jsonToSseResponse(data, res)
 }
 
 /** Is `model` one that needs the signed `maas_type: benefit` header? */
@@ -750,8 +813,13 @@ async function signedFetch(cred, input, init, context) {
   const parsed = body.length > 0 ? safeJson(new TextDecoder().decode(body)) : null
   const model = parsed?.model
   const extra = isBenefitModel(model) ? { maas_type: "benefit" } : undefined
-  const foldToCompletion = needsStreamMetering(parsed)
-  if (foldToCompletion) body = utf8(JSON.stringify({ ...parsed, stream: true }))
+
+  // Force stream:false so CodeArts does not meter. Remember whether the caller
+  // originally asked for a stream so we can synthesize SSE on the way back.
+  const originalWantedStream = isChatRequest(parsed) && parsed.stream === true
+  if (isChatRequest(parsed)) {
+    body = utf8(JSON.stringify({ ...parsed, stream: false }))
+  }
 
   // Signing is repeated on a credential renewal, so keep it a step of its own.
   let activeCred = cred
@@ -801,7 +869,7 @@ async function signedFetch(cred, input, init, context) {
       let answer = null
       if (res.ok) {
         const peeked = await peekSseQueueError(res)
-        if (!peeked.retry) return finalizeChatAnswer(peeked.response, foldToCompletion)
+        if (!peeked.retry) return finalizeChatAnswer(peeked.response, originalWantedStream)
         const probed = await queryQueueStatus(cred, model, queueContext)
         if (probed?.status === "error" || probed?.status === "queue_full") return queueTerminalResponse(probed)
         queued = true
@@ -1553,7 +1621,7 @@ export const _internal = {
   isQueueErrorResponse, isRetryableQueueCode, streamHeaders, rebuildResponse,
   sseErrorCode, isQuotaExhaustedCode, isExpiredCredentialResponse,
   isPermanentRefreshFailure, sseEventHasContent, classifySseHead, signInExpiredResponse,
-  needsStreamMetering, parseSseEvents, completionFromChunks, benefitWindow, creditWindow,
+  isChatRequest, parseSseEvents, completionFromChunks, jsonToSseResponse, benefitWindow, creditWindow,
   peekSseQueueError, queueTerminalResponse, queryQueueStatus,
   parseModelInfo, extractArray, fetchRemoteModels, usageFromStatistics,
 }
