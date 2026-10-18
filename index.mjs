@@ -128,12 +128,32 @@ const CONTEXT_WINDOWS = {
   "deepseek-v4.1-flash": 1000000,
 }
 
+// ---- non-stream model alias (local only; stripped before talking to the gateway) ----
+// Host picks `codearts/<id>-nonstream` to force a non-streaming upstream call
+// (avoids gateway stream timeout on long one-shot replies, and opts out of metering).
+// The suffix is never sent upstream: only used to choose request/response shape.
+const NONSTREAM_SUFFIX = "-nonstream"
+
+function isNonstreamModelId(id) {
+  return typeof id === "string" && id.endsWith(NONSTREAM_SUFFIX)
+}
+
+function stripNonstreamSuffix(id) {
+  if (!isNonstreamModelId(id)) return id
+  return id.slice(0, -NONSTREAM_SUFFIX.length)
+}
+
+function withNonstreamSuffix(id) {
+  if (!id || isNonstreamModelId(id)) return id
+  return id + NONSTREAM_SUFFIX
+}
+
 // The models offered before (or instead of) the account's own live list.
 // Ids are exactly what the backend registers: the free models carry their dated
 // ids, because the benefit header only accepts those. `GLM-5` is gone — the
 // endpoint answers `InferHub.002002009.404` for it, so listing it only produced
 // a picker row that could not be called.
-const CATALOG = [
+const CATALOG_BASE = [
   { id: "GLM-5.2", name: "GLM-5.2" },
   { id: "GLM-5.1", name: "GLM-5.1" },
   { id: "glm-5.3-flash", name: "GLM-5.3 Flash" },
@@ -143,6 +163,11 @@ const CATALOG = [
   { id: "deepseek-v4-pro-0813", name: "DeepSeek V4 Pro" },
   { id: "deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash" },
 ]
+// Each base model is also published as `<id>-nonstream` for opt-in non-streaming.
+const CATALOG = CATALOG_BASE.flatMap((m) => [
+  m,
+  { id: withNonstreamSuffix(m.id), name: `${m.name} (nonstream)` },
+])
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -702,13 +727,96 @@ function completionFromChunks(events) {
 }
 
 /**
- * Answer a caller that asked for JSON with JSON. A stream carrying no choices is
- * an upstream error (quota, routing), and that payload must reach the caller
- * byte-for-byte rather than be turned into an empty completion.
+ * Turn a non-streaming chat.completion JSON into a synthetic SSE stream so
+ * callers that asked for stream:true still receive text/event-stream.
  */
-async function finalizeChatAnswer(res, foldToCompletion) {
-  if (!foldToCompletion) return res
+function jsonToSseResponse(completion, originalRes) {
+  const id = firstOf(completion.id) || `chatcmpl-${Math.floor(Date.now() / 1000)}`
+  const model = typeof completion.model === "string" ? completion.model : ""
+  const created = num(completion.created) || Math.floor(Date.now() / 1000)
+  const choice = Array.isArray(completion.choices) ? completion.choices[0] : {}
+  const message = asRecord(choice?.message)
+  const content = typeof message.content === "string" ? message.content : ""
+  const reasoning = typeof message.reasoning_content === "string" ? message.reasoning_content : ""
+  const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : null
+  const finish = choice?.finish_reason ?? "stop"
+  const usage = completion.usage
+
+  const chunks = []
+  chunks.push({
+    id, object: "chat.completion.chunk", created, model,
+    choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+  })
+  if (reasoning) {
+    chunks.push({
+      id, object: "chat.completion.chunk", created, model,
+      choices: [{ index: 0, delta: { reasoning_content: reasoning }, finish_reason: null }],
+    })
+  }
+  if (content) {
+    chunks.push({
+      id, object: "chat.completion.chunk", created, model,
+      choices: [{ index: 0, delta: { content }, finish_reason: null }],
+    })
+  }
+  if (toolCalls && toolCalls.length > 0) {
+    chunks.push({
+      id, object: "chat.completion.chunk", created, model,
+      choices: [{ index: 0, delta: { tool_calls: toolCalls }, finish_reason: null }],
+    })
+  }
+  const finalChunk = {
+    id, object: "chat.completion.chunk", created, model,
+    choices: [{ index: 0, delta: {}, finish_reason: finish }],
+  }
+  if (usage) finalChunk.usage = usage
+  chunks.push(finalChunk)
+
+  const sseBody = chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join("") + "data: [DONE]\n\n"
+  const headers = streamHeaders(originalRes.headers)
+  headers.set("content-type", "text/event-stream")
+  return new Response(sseBody, {
+    status: originalRes.status,
+    statusText: originalRes.statusText,
+    headers,
+  })
+}
+
+/**
+ * foldToCompletion: SSE → JSON (host asked non-stream, we forced stream upstream).
+ * expandToStream: JSON → SSE (host asked stream, we forced non-stream for -nonstream models).
+ * Error payloads map 4291 → HTTP 429 and other error_codes → 502 for account failover.
+ */
+async function finalizeChatAnswer(res, { foldToCompletion = false, expandToStream = false } = {}) {
+  // Pass-through when neither conversion is needed
+  if (!foldToCompletion && !expandToStream) return res
+
   const text = await res.text()
+
+  if (expandToStream) {
+    const data = safeJson(text)
+    if (!data || !Array.isArray(data.choices) || data.choices.length === 0) {
+      const code = String(data?.error_code ?? data?.errorCode ?? "")
+      if (/4291/.test(code)) {
+        return new Response(text, {
+          status: 429,
+          statusText: "Too Many Requests",
+          headers: { "content-type": "application/json" },
+        })
+      }
+      if (code) {
+        return new Response(text, {
+          status: 502,
+          statusText: "Bad Gateway",
+          headers: { "content-type": "application/json" },
+        })
+      }
+      return rebuildResponse(res, text)
+    }
+    return jsonToSseResponse(data, res)
+  }
+
+  // foldToCompletion: SSE → JSON
   const events = parseSseEvents(text)
   const answered = events.some((ev) => Array.isArray(ev.choices) && ev.choices.length > 0)
   if (!answered) return rebuildResponse(res, text)
@@ -723,7 +831,7 @@ async function finalizeChatAnswer(res, foldToCompletion) {
 
 /** Is `model` one that needs the signed `maas_type: benefit` header? */
 function isBenefitModel(model) {
-  const id = String(model ?? "")
+  const id = stripNonstreamSuffix(String(model ?? ""))
   return benefitModelIds.includes(id) || BENEFIT_MODEL_FALLBACK.includes(id)
 }
 
@@ -748,10 +856,31 @@ async function signedFetch(cred, input, init, context) {
   else body = new Uint8Array()
   // The body is part of the signature, so any rewrite happens before signing.
   const parsed = body.length > 0 ? safeJson(new TextDecoder().decode(body)) : null
-  const model = parsed?.model
+  // -nonstream suffix is a local switch only: strip before isBenefitModel / upstream.
+  const requestedModel = typeof parsed?.model === "string" ? parsed.model : undefined
+  const nonstream = isNonstreamModelId(requestedModel)
+  const model = stripNonstreamSuffix(requestedModel)
   const extra = isBenefitModel(model) ? { maas_type: "benefit" } : undefined
-  const foldToCompletion = needsStreamMetering(parsed)
-  if (foldToCompletion) body = utf8(JSON.stringify({ ...parsed, stream: true }))
+
+  // Host still often sends stream:true; remember so we can synthesize SSE on the way back.
+  const hostWantedStream = parsed?.stream === true
+
+  let foldToCompletion = false
+  let expandToStream = false
+  if (parsed && typeof parsed === "object" && Array.isArray(parsed.messages)) {
+    if (nonstream) {
+      // Opt-in non-stream path: send stream:false + real model id (suffix stripped).
+      expandToStream = hostWantedStream
+      body = utf8(JSON.stringify({ ...parsed, model, stream: false }))
+    } else if (needsStreamMetering(parsed)) {
+      // Default metering path: force stream:true, fold SSE back to JSON if host asked non-stream.
+      foldToCompletion = true
+      body = utf8(JSON.stringify({ ...parsed, stream: true }))
+    } else if (model !== requestedModel) {
+      // Safety: never leak the local suffix upstream even on the default path.
+      body = utf8(JSON.stringify({ ...parsed, model }))
+    }
+  }
 
   // Signing is repeated on a credential renewal, so keep it a step of its own.
   let activeCred = cred
@@ -801,7 +930,7 @@ async function signedFetch(cred, input, init, context) {
       let answer = null
       if (res.ok) {
         const peeked = await peekSseQueueError(res)
-        if (!peeked.retry) return finalizeChatAnswer(peeked.response, foldToCompletion)
+        if (!peeked.retry) return finalizeChatAnswer(peeked.response, { foldToCompletion, expandToStream })
         const probed = await queryQueueStatus(cred, model, queueContext)
         if (probed?.status === "error" || probed?.status === "queue_full") return queueTerminalResponse(probed)
         queued = true
@@ -1336,22 +1465,28 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
     return gate
   }
 
-  const configModel = (m) => ({
-    name: m.name ?? m.id,
-    limit: { context: m.context ?? 0, output: 0 },
-    tool_call: true,
-    // magpie's own field: the model is served from the free daily token pool,
-    // not the plan's credits, so its picker row says 免费.
-    ...(isBenefitModel(m.id) ? { free: true } : {}),
-  })
+  const configModel = (m) => {
+    const bare = stripNonstreamSuffix(m.id)
+    const context = m.context ?? CONTEXT_WINDOWS[bare] ?? CONTEXT_WINDOWS[normalizeModelId(bare)] ?? 0
+    return {
+      name: m.name ?? m.id,
+      limit: { context, output: 0 },
+      tool_call: true,
+      // magpie's own field: the model is served from the free daily token pool,
+      // not the plan's credits, so its picker row says 免费.
+      ...(isBenefitModel(m.id) ? { free: true } : {}),
+    }
+  }
 
   const modelOf = (provider, live) => {
-    const base = provider.models?.[live.id] ?? {}
+    const bare = stripNonstreamSuffix(live.id)
+    const base = provider.models?.[live.id] ?? provider.models?.[bare] ?? {}
+    const context = live.context ?? base.limit?.context ?? CONTEXT_WINDOWS[bare] ?? CONTEXT_WINDOWS[normalizeModelId(bare)] ?? 0
     return {
       ...base,
       id: live.id,
       name: live.name || base.name || live.id,
-      limit: { context: live.context ?? base.limit?.context ?? 0, output: 0 },
+      limit: { context, output: 0 },
       // Same source of truth as the signed `maas_type: benefit` header, so a
       // model never shows as free while being billed as paid, or the reverse.
       ...(live.benefit === true || isBenefitModel(live.id) ? { free: true } : {}),
@@ -1379,7 +1514,14 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
         try {
           const list = await fetchRemoteModels(cred, fetcher)
           if (!list.length) return provider.models
-          return Object.fromEntries(list.map((m) => [m.id, modelOf(provider, m)]))
+          const entries = []
+          for (const m of list) {
+            entries.push([m.id, modelOf(provider, m)])
+            // Local non-stream alias; upstream still sees the bare id.
+            const nsId = withNonstreamSuffix(m.id)
+            entries.push([nsId, modelOf(provider, { ...m, id: nsId, name: `${m.name || m.id} (nonstream)` })])
+          }
+          return Object.fromEntries(entries)
         } catch {
           return provider.models
         }
@@ -1553,7 +1695,7 @@ export const _internal = {
   isQueueErrorResponse, isRetryableQueueCode, streamHeaders, rebuildResponse,
   sseErrorCode, isQuotaExhaustedCode, isExpiredCredentialResponse,
   isPermanentRefreshFailure, sseEventHasContent, classifySseHead, signInExpiredResponse,
-  needsStreamMetering, parseSseEvents, completionFromChunks, benefitWindow, creditWindow,
+  NONSTREAM_SUFFIX, isNonstreamModelId, stripNonstreamSuffix, withNonstreamSuffix, needsStreamMetering, parseSseEvents, completionFromChunks, jsonToSseResponse, benefitWindow, creditWindow,
   peekSseQueueError, queueTerminalResponse, queryQueueStatus,
   parseModelInfo, extractArray, fetchRemoteModels, usageFromStatistics,
 }
