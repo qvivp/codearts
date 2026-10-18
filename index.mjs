@@ -772,16 +772,36 @@ function jsonToSseResponse(completion, originalRes) {
  * Error payloads (no choices) are left untouched.
  */
 async function finalizeChatAnswer(res, originalWantedStream) {
-  if (!originalWantedStream) return res
-
   const text = await res.text()
   const data = safeJson(text)
 
+  // Upstream error (quota, routing, etc.): no choices to fold.
   if (!data || !Array.isArray(data.choices) || data.choices.length === 0) {
+    const code = String(data?.error_code ?? data?.errorCode ?? "")
+    // 4291 = insufficient quota → 429 so magpie can fail over to another account
+    if (/4291/.test(code)) {
+      return new Response(text, {
+        status: 429,
+        statusText: "Too Many Requests",
+        headers: { "content-type": "application/json" },
+      })
+    }
+    // Other terminal vendor errors → 502 (also triggers account failover)
+    if (code) {
+      return new Response(text, {
+        status: 502,
+        statusText: "Bad Gateway",
+        headers: { "content-type": "application/json" },
+      })
+    }
     return rebuildResponse(res, text)
   }
 
-  return jsonToSseResponse(data, res)
+  // Normal completion: synthesize SSE if the caller asked for a stream
+  if (originalWantedStream) {
+    return jsonToSseResponse(data, res)
+  }
+  return rebuildResponse(res, text)
 }
 
 /** Is `model` one that needs the signed `maas_type: benefit` header? */
